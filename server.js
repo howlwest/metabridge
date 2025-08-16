@@ -6,7 +6,18 @@ import fetch from "node-fetch";
 const app = express();
 app.use(cors());
 app.use(express.json());
+// --- API key simple para Acciones del GPT ---
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 
+app.use((req, res, next) => {
+  // Solo protegemos los endpoints "de negocio" (puedes excluir /api/health si quieres)
+  const openPaths = ["/api/health"];
+  if (openPaths.includes(req.path)) return next();
+
+  const key = req.header("X-API-Key");
+  if (!BRIDGE_API_KEY || key === BRIDGE_API_KEY) return next();
+  return res.status(401).json({ error: "Unauthorized" });
+});
 // ====== CONFIG ======
 const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v23.0";
 const AD_ACCOUNT_ID = process.env.META_AD_ACCOUNT_ID;     // ej: act_123456789012345
