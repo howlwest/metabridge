@@ -1,100 +1,311 @@
 import express from "express";
-import axios from "axios";
 import cors from "cors";
-import fetch from "node-fetch";
+import axios from "axios";
 
 const app = express();
 app.use(cors());
 app.use(express.json());
-// --- API key simple para Acciones del GPT ---
-const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY;
 
-app.use((req, res, next) => {
-  // Solo protegemos los endpoints "de negocio" (puedes excluir /api/health si quieres)
-  const openPaths = ["/api/health"];
-  if (openPaths.includes(req.path)) return next();
-
-  const key = req.header("X-API-Key");
-  if (!BRIDGE_API_KEY || key === BRIDGE_API_KEY) return next();
-  return res.status(401).json({ error: "Unauthorized" });
-});
-// ====== CONFIG ======
-const GRAPH_VERSION = process.env.META_GRAPH_VERSION || "v23.0";
-const AD_ACCOUNT_ID = process.env.META_AD_ACCOUNT_ID;     // ej: act_123456789012345
-const TOKEN = process.env.META_SYSTEM_USER_TOKEN;        // System User token
+/* =========================
+   CONFIG / ENV
+========================= */
+const GRAPH_VERSION =
+  process.env.META_GRAPH_VERSION?.trim() || "v23.0";
+const AD_ACCOUNT_ID =
+  process.env.META_AD_ACCOUNT_ID?.trim(); // ej: act_123456789012345
+const TOKEN =
+  process.env.META_ACCESS_TOKEN?.trim() ||
+  process.env.META_SYSTEM_USER_TOKEN?.trim(); // compat
+const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY?.trim();
 const PORT = process.env.PORT || 5000;
-// =====================
+
+const hasEssentialEnv =
+  Boolean(AD_ACCOUNT_ID) && Boolean(TOKEN);
 
 const BASE = (p) => `https://graph.facebook.com/${GRAPH_VERSION}/${p}`;
+const authHeader = { Authorization: `Bearer ${TOKEN}` };
 
-// Salud
-app.get("/api/health", (_req, res) => {
-  res.json({ ok: true, version: GRAPH_VERSION, timestamp: new Date() });
+/* =========================
+   API KEY GUARD
+========================= */
+// Rutas abiertas (sin API key)
+const OPEN_PATHS = new Set(["/api/health", "/healthz"]);
+
+app.use((req, res, next) => {
+  if (OPEN_PATHS.has(req.path)) return next();
+  // Permite también OPTIONS CORS preflight
+  if (req.method === "OPTIONS") return next();
+
+  // Si no definiste BRIDGE_API_KEY, no bloquees (útil para pruebas locales)
+  if (!BRIDGE_API_KEY) return next();
+
+  const key = req.header("X-API-Key");
+  if (key && key === BRIDGE_API_KEY) return next();
+
+  return res.status(401).json({ error: "Unauthorized" });
 });
 
-// Insights (GET rápido últimos 7d)
+/* =========================
+   HEALTH
+========================= */
+app.get("/api/health", (_req, res) => {
+  res.json({
+    ok: true,
+    version: GRAPH_VERSION,
+    hasEnv: {
+      AD_ACCOUNT_ID: Boolean(AD_ACCOUNT_ID),
+      TOKEN: Boolean(TOKEN),
+    },
+    timestamp: new Date(),
+  });
+});
+
+// Alias para health-checks de plataforma
+app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+
+/* =========================
+   HELPERS
+========================= */
+function ensureEnv(res) {
+  if (!hasEssentialEnv) {
+    res.status(500).json({
+      error: "Missing required env vars",
+      details: {
+        META_AD_ACCOUNT_ID: Boolean(AD_ACCOUNT_ID),
+        META_ACCESS_TOKEN: Boolean(process.env.META_ACCESS_TOKEN),
+        META_SYSTEM_USER_TOKEN: Boolean(process.env.META_SYSTEM_USER_TOKEN),
+      },
+    });
+    return false;
+  }
+  return true;
+}
+
+function toCents(eur) {
+  const n = Number(eur);
+  if (Number.isNaN(n)) return undefined;
+  return Math.round(n * 100);
+}
+
+/* =========================
+   INSIGHTS
+========================= */
+
+// GET rápido: últimos 7 días a nivel campaña
 app.get("/api/insights", async (_req, res) => {
   try {
-    const url = `${BASE(`${AD_ACCOUNT_ID}/insights`)}?fields=campaign_name,impressions,clicks,spend&level=campaign&date_preset=last_7d&access_token=${TOKEN}`;
-    const r = await fetch(url);
-    const data = await r.json();
+    if (!ensureEnv(res)) return;
+
+    const url = BASE(`${AD_ACCOUNT_ID}/insights`);
+    const params = {
+      level: "campaign",
+      date_preset: "last_7d",
+      fields: "campaign_name,impressions,clicks,spend",
+    };
+
+    const { data } = await axios.get(url, {
+      params,
+      headers: authHeader,
+    });
+
     res.json(data);
   } catch (err) {
-    console.error("Error insights GET:", err);
+    console.error("GET /api/insights error:", err?.response?.data || err.message);
     res.status(500).json({ error: "No se pudieron obtener insights" });
   }
 });
 
-// Insights (POST flexible con fechas/breakdowns/fields)
+// POST flexible: fechas / level / breakdowns / fields / time_increment
 app.post("/api/insights", async (req, res) => {
   try {
-    const { level="ad", since, until, time_increment="1", breakdowns, fields } = req.body || {};
+    if (!ensureEnv(res)) return;
+
+    const {
+      level = "ad",
+      since,
+      until,
+      time_increment = "1",
+      breakdowns,
+      fields,
+      date_preset, // opcional
+    } = req.body || {};
+
     const url = BASE(`${AD_ACCOUNT_ID}/insights`);
     const params = {
       level,
-      time_range: since && until ? JSON.stringify({ since, until }) : undefined,
       time_increment,
-      fields: fields || "date_start,ad_id,adset_id,campaign_id,spend,clicks,ctr,cpm,actions,action_values,roas"
+      fields:
+        fields ||
+        "date_start,ad_id,adset_id,campaign_id,spend,clicks,ctr,cpm,actions,action_values,roas",
     };
-    if (breakdowns) params.breakdowns = breakdowns;
 
-    const { data } = await axios.get(url, { params, headers: { Authorization: `Bearer ${TOKEN}` } });
+    if (breakdowns) params.breakdowns = breakdowns;
+    if (since && until) {
+      params.time_range = JSON.stringify({ since, until });
+    } else if (date_preset) {
+      params.date_preset = date_preset;
+    }
+
+    const { data } = await axios.get(url, {
+      params,
+      headers: authHeader,
+    });
+
     res.json(data);
-  } catch (e) {
-    res.status(400).json({ error: e?.response?.data || e.message });
+  } catch (err) {
+    console.error("POST /api/insights error:", err?.response?.data || err.message);
+    res.status(400).json({ error: err?.response?.data || err.message });
   }
 });
 
-// Cambiar presupuesto ad set (EUR → céntimos)
+/* =========================
+   CAMBIAR PRESUPUESTO AD SET
+========================= */
 app.post("/api/adset_budget", async (req, res) => {
   try {
+    if (!ensureEnv(res)) return;
+
     const { adset_id, daily_budget_eur } = req.body || {};
-    if (!adset_id || !daily_budget_eur) return res.status(400).json({ error: "adset_id y daily_budget_eur son requeridos" });
+    if (!adset_id || daily_budget_eur === undefined) {
+      return res
+        .status(400)
+        .json({ error: "adset_id y daily_budget_eur son requeridos" });
+    }
+
+    const daily_budget = toCents(daily_budget_eur);
+    if (daily_budget === undefined)
+      return res.status(400).json({ error: "daily_budget_eur inválido" });
+
     const url = BASE(`${adset_id}`);
-    const params = { daily_budget: Math.round(Number(daily_budget_eur) * 100) };
-    const { data } = await axios.post(url, null, { params, headers: { Authorization: `Bearer ${TOKEN}` } });
+    const params = { daily_budget };
+
+    const { data } = await axios.post(url, null, {
+      params,
+      headers: authHeader,
+    });
+
     res.json({ updated: true, meta: data });
-  } catch (e) {
-    res.status(400).json({ error: e?.response?.data || e.message });
+  } catch (err) {
+    console.error("POST /api/adset_budget error:", err?.response?.data || err.message);
+    res.status(400).json({ error: err?.response?.data || err.message });
   }
 });
 
-// Cambiar estado anuncio
+/* =========================
+   CAMBIAR ESTADO ANUNCIO
+========================= */
 app.post("/api/ad_status", async (req, res) => {
   try {
+    if (!ensureEnv(res)) return;
+
     const { ad_id, status } = req.body || {};
-    if (!ad_id || !status) return res.status(400).json({ error: "ad_id y status son requeridos" });
+    if (!ad_id || !status)
+      return res.status(400).json({ error: "ad_id y status son requeridos" });
+
     const url = BASE(`${ad_id}`);
-    const { data } = await axios.post(url, null, { params: { status }, headers: { Authorization: `Bearer ${TOKEN}` } });
+    const params = { status };
+
+    const { data } = await axios.post(url, null, {
+      params,
+      headers: authHeader,
+    });
+
     res.json({ updated: true, meta: data });
-  } catch (e) {
-    res.status(400).json({ error: e?.response?.data || e.message });
+  } catch (err) {
+    console.error("POST /api/ad_status error:", err?.response?.data || err.message);
+    res.status(400).json({ error: err?.response?.data || err.message });
   }
 });
 
-// Start server listening on all interfaces
+/* =========================
+   SIMULACIÓN DE DECISIONES
+   (No ejecuta cambios reales)
+========================= */
+const DEFAULT_POLICY = {
+  // % máximo de subida/bajada por propuesta
+  maxIncreasePct: 30,
+  maxDecreasePct: 30,
+
+  // presupuesto mínimo tras cambio (EUR)
+  minDailyBudgetEur: 1,
+
+  // estados permitidos
+  allowStatuses: new Set(["PAUSED", "ACTIVE", "ARCHIVED"]),
+};
+
+app.post("/api/simulate", async (req, res) => {
+  try {
+    const { context = {}, proposals = [] } = req.body || {};
+    if (!Array.isArray(proposals))
+      return res.status(400).json({ error: "proposals debe ser un array" });
+
+    const results = proposals.map((p) => {
+      const outcome = { id: p.id, type: p.type, approved: false, reason: "" };
+
+      if (p.type === "budget_change") {
+        const { delta_pct, new_daily_budget_eur } = p;
+        // Reglas simples:
+        if (typeof new_daily_budget_eur === "number") {
+          if (new_daily_budget_eur < DEFAULT_POLICY.minDailyBudgetEur) {
+            outcome.reason = `Presupuesto < mínimo (${DEFAULT_POLICY.minDailyBudgetEur} EUR)`;
+            return outcome;
+          }
+        }
+        if (typeof delta_pct === "number") {
+          if (
+            delta_pct > DEFAULT_POLICY.maxIncreasePct ||
+            delta_pct < -DEFAULT_POLICY.maxDecreasePct
+          ) {
+            outcome.reason = `delta_pct fuera de umbral (+${DEFAULT_POLICY.maxIncreasePct}/-${DEFAULT_POLICY.maxDecreasePct})`;
+            return outcome;
+          }
+        }
+        outcome.approved = true;
+        outcome.reason = "OK";
+        return outcome;
+      }
+
+      if (p.type === "status_change") {
+        if (!DEFAULT_POLICY.allowStatuses.has(p.new_status)) {
+          outcome.reason = "Estado no permitido";
+          return outcome;
+        }
+        outcome.approved = true;
+        outcome.reason = "OK";
+        return outcome;
+      }
+
+      outcome.reason = "Tipo no soportado";
+      return outcome;
+    });
+
+    res.json({
+      contextEcho: context,
+      policy: {
+        maxIncreasePct: DEFAULT_POLICY.maxIncreasePct,
+        maxDecreasePct: DEFAULT_POLICY.maxDecreasePct,
+        minDailyBudgetEur: DEFAULT_POLICY.minDailyBudgetEur,
+        allowStatuses: Array.from(DEFAULT_POLICY.allowStatuses),
+      },
+      results,
+    });
+  } catch (err) {
+    console.error("POST /api/simulate error:", err.message);
+    res.status(500).json({ error: "Error simulando propuestas" });
+  }
+});
+
+/* =========================
+   404 + ERROR HANDLER
+========================= */
+app.use((req, res) => {
+  res.status(404).json({ error: "Not found" });
+});
+
+/* =========================
+   START
+========================= */
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Meta Marketing API Bridge running on port ${PORT}`);
   console.log(`📡 Health check: http://localhost:${PORT}/api/health`);
-  console.log(`🌐 Public URL: https://${process.env.REPLIT_DOMAINS}`);
 });
