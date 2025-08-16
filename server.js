@@ -33,7 +33,6 @@ const OPEN_PATHS = new Set(["/api/health", "/healthz"]);
 
 app.use((req, res, next) => {
   if (OPEN_PATHS.has(req.path)) return next();
-  // Permite también OPTIONS CORS preflight
   if (req.method === "OPTIONS") return next();
 
   // Si no definiste BRIDGE_API_KEY, no bloquees (útil para pruebas locales)
@@ -244,7 +243,6 @@ app.post("/api/simulate", async (req, res) => {
 
       if (p.type === "budget_change") {
         const { delta_pct, new_daily_budget_eur } = p;
-        // Reglas simples:
         if (typeof new_daily_budget_eur === "number") {
           if (new_daily_budget_eur < DEFAULT_POLICY.minDailyBudgetEur) {
             outcome.reason = `Presupuesto < mínimo (${DEFAULT_POLICY.minDailyBudgetEur} EUR)`;
