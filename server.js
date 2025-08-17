@@ -9,18 +9,15 @@ app.use(express.json());
 /* =========================
    CONFIG / ENV
 ========================= */
-const GRAPH_VERSION =
-  process.env.META_GRAPH_VERSION?.trim() || "v23.0";
-const AD_ACCOUNT_ID =
-  process.env.META_AD_ACCOUNT_ID?.trim(); // ej: act_123456789012345
+const GRAPH_VERSION = process.env.META_GRAPH_VERSION?.trim() || "v23.0";
+const AD_ACCOUNT_ID = process.env.META_AD_ACCOUNT_ID?.trim(); // ej: act_123456789012345
 const TOKEN =
   process.env.META_ACCESS_TOKEN?.trim() ||
   process.env.META_SYSTEM_USER_TOKEN?.trim(); // compat
 const BRIDGE_API_KEY = process.env.BRIDGE_API_KEY?.trim();
 const PORT = process.env.PORT || 5000;
 
-const hasEssentialEnv =
-  Boolean(AD_ACCOUNT_ID) && Boolean(TOKEN);
+const hasEssentialEnv = Boolean(AD_ACCOUNT_ID) && Boolean(TOKEN);
 
 const BASE = (p) => `https://graph.facebook.com/${GRAPH_VERSION}/${p}`;
 const authHeader = { Authorization: `Bearer ${TOKEN}` };
@@ -218,66 +215,85 @@ app.post("/api/ad_status", async (req, res) => {
 
 /* =========================
    SIMULACIÓN DE DECISIONES
-   (No ejecuta cambios reales)
+   (Acepta tanto proposals[] como action+payload)
 ========================= */
 const DEFAULT_POLICY = {
-  // % máximo de subida/bajada por propuesta
   maxIncreasePct: 30,
   maxDecreasePct: 30,
-
-  // presupuesto mínimo tras cambio (EUR)
   minDailyBudgetEur: 1,
-
-  // estados permitidos
   allowStatuses: new Set(["PAUSED", "ACTIVE", "ARCHIVED"]),
 };
 
 app.post("/api/simulate", async (req, res) => {
   try {
-    const { context = {}, proposals = [] } = req.body || {};
-    if (!Array.isArray(proposals))
-      return res.status(400).json({ error: "proposals debe ser un array" });
+    const { context = {}, proposals, action, payload } = req.body || {};
+    let results = [];
 
-    const results = proposals.map((p) => {
-      const outcome = { id: p.id, type: p.type, approved: false, reason: "" };
+    if (Array.isArray(proposals)) {
+      // --- modo "array de propuestas"
+      results = proposals.map((p) => {
+        const outcome = { id: p.id, type: p.type, approved: false, reason: "" };
 
-      if (p.type === "budget_change") {
-        const { delta_pct, new_daily_budget_eur } = p;
-        if (typeof new_daily_budget_eur === "number") {
-          if (new_daily_budget_eur < DEFAULT_POLICY.minDailyBudgetEur) {
-            outcome.reason = `Presupuesto < mínimo (${DEFAULT_POLICY.minDailyBudgetEur} EUR)`;
-            return outcome;
+        if (p.type === "budget_change") {
+          const { delta_pct, new_daily_budget_eur } = p;
+          if (typeof new_daily_budget_eur === "number") {
+            if (new_daily_budget_eur < DEFAULT_POLICY.minDailyBudgetEur) {
+              outcome.reason = `Presupuesto < mínimo (${DEFAULT_POLICY.minDailyBudgetEur} EUR)`;
+              return outcome;
+            }
           }
-        }
-        if (typeof delta_pct === "number") {
-          if (
-            delta_pct > DEFAULT_POLICY.maxIncreasePct ||
-            delta_pct < -DEFAULT_POLICY.maxDecreasePct
-          ) {
-            outcome.reason = `delta_pct fuera de umbral (+${DEFAULT_POLICY.maxIncreasePct}/-${DEFAULT_POLICY.maxDecreasePct})`;
-            return outcome;
+          if (typeof delta_pct === "number") {
+            if (
+              delta_pct > DEFAULT_POLICY.maxIncreasePct ||
+              delta_pct < -DEFAULT_POLICY.maxDecreasePct
+            ) {
+              outcome.reason = `delta_pct fuera de umbral (+${DEFAULT_POLICY.maxIncreasePct}/-${DEFAULT_POLICY.maxDecreasePct})`;
+              return outcome;
+            }
           }
-        }
-        outcome.approved = true;
-        outcome.reason = "OK";
-        return outcome;
-      }
-
-      if (p.type === "status_change") {
-        if (!DEFAULT_POLICY.allowStatuses.has(p.new_status)) {
-          outcome.reason = "Estado no permitido";
+          outcome.approved = true;
+          outcome.reason = "OK";
           return outcome;
         }
-        outcome.approved = true;
-        outcome.reason = "OK";
-        return outcome;
-      }
 
-      outcome.reason = "Tipo no soportado";
-      return outcome;
-    });
+        if (p.type === "status_change") {
+          if (!DEFAULT_POLICY.allowStatuses.has(p.new_status)) {
+            outcome.reason = "Estado no permitido";
+            return outcome;
+          }
+          outcome.approved = true;
+          outcome.reason = "OK";
+          return outcome;
+        }
+
+        outcome.reason = "Tipo no soportado";
+        return outcome;
+      });
+    } else if (action && payload) {
+      // --- modo "action + payload"
+      if (action === "ad_status") {
+        const outcome = {
+          type: "status_change",
+          payload,
+          approved: false,
+          reason: "",
+        };
+        if (DEFAULT_POLICY.allowStatuses.has(payload.status)) {
+          outcome.approved = true;
+          outcome.reason = `Status change to ${payload.status} is allowed.`;
+        } else {
+          outcome.reason = `Status ${payload.status} not allowed.`;
+        }
+        results.push(outcome);
+      } else {
+        results.push({ type: action, approved: false, reason: "Acción no soportada" });
+      }
+    } else {
+      return res.status(400).json({ error: "Falta proposals[] o action+payload" });
+    }
 
     res.json({
+      mode: "simulation",
       contextEcho: context,
       policy: {
         maxIncreasePct: DEFAULT_POLICY.maxIncreasePct,
@@ -286,6 +302,7 @@ app.post("/api/simulate", async (req, res) => {
         allowStatuses: Array.from(DEFAULT_POLICY.allowStatuses),
       },
       results,
+      timestamp: new Date().toISOString(),
     });
   } catch (err) {
     console.error("POST /api/simulate error:", err.message);
